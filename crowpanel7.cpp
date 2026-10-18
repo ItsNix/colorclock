@@ -1,22 +1,70 @@
 #include <Arduino.h>
+#include <Wire.h>
 #include "crowpanel7.h"
 #include <esp_lcd_panel_ops.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
-#define LCD_BL_PIN     2
-// 928 x 525 clocks per frame (incl. porches): 20 MHz ≈ 41 Hz refresh. Elecrow's
-// reference 12 MHz (≈25 Hz) shows rolling flicker on colors the panel dithers.
-// Must divide 160 MHz evenly (16, 20, 26.67 ...).
-#define LCD_PCLK_HZ    (20 * 1000 * 1000)
-#define BOUNCE_LINES   10   // two SRAM bounce buffers of SCREEN_W * BOUNCE_LINES px
-
-// Panel data pins in color-bit order: B0..B4, G0..G5, R0..R4
-static const int DATA_PINS[16] = {
-  15, 7, 6, 5, 4,            // B0-B4
-  9, 46, 3, 8, 16, 1,        // G0-G5
-  14, 21, 47, 48, 45,        // R0-R4
+// ── Per-board configuration ─────────────────────────────────────────────────
+// Pin and timing values from Elecrow's reference code for each board.
+struct BoardConfig {
+  const char* name;
+  int data_pins[16];          // color-bit order: B0..B4, G0..G5, R0..R4
+  int hsync, vsync, de, pclk;
+  uint32_t pclk_hz;
+  uint32_t hsync_pulse, hsync_back, hsync_front;
+  uint32_t vsync_pulse, vsync_back, vsync_front;
+  bool hsync_idle_low, vsync_idle_low, pclk_active_neg, pclk_idle_high;
+  bool bb_invalidate_cache;
+  int touch_sda, touch_scl;
 };
+
+#if defined(BOARD_CROWPANEL_7)
+// Elecrow gfx_conf.h (CrowPanel_70), identical for V2.x and V3.0.
+// 928 x 525 clocks per frame: 20 MHz ≈ 41 Hz. Elecrow's 12 MHz (≈25 Hz) showed
+// rolling flicker; 26.67 MHz exceeds PSRAM bandwidth (artifacts).
+static const BoardConfig BOARD = {
+  "CrowPanel 7.0 (DIS08070H)",
+  { 15, 7, 6, 5, 4,   9, 46, 3, 8, 16, 1,   14, 21, 47, 48, 45 },
+  39, 40, 41, 0,               // GPIO 0 = BOOT strap; unusable as a button
+  20 * 1000 * 1000,
+  48, 40, 40,
+  31, 13, 1,
+  true, true, true, false,     // Elecrow's pclk_active_neg = 1 (LovyanGFX's Bus_RGB ignored it)
+  false,
+  19, 20,
+};
+#define LCD_BL_PIN       2
+#define PCA9557_ADDR     0x18  // V3.0: gates GT911 RST/INT; absent on V2.x (writes ignored)
+#define PCA9557_OUTPUT   0x01
+#define PCA9557_CONFIG   0x03  // bit = 1 → input
+#define BOARD_IO38       38    // driven LOW by Elecrow's V3.0 reference code
+
+#elif defined(BOARD_CROWPANEL_ADVANCE_7)
+// Elecrow CrowPanel-Advance-7 repo, example/V1.3_and_V1.4_and_V1.5 (esp_lcd config).
+// 820 x 500 clocks per frame: 18 MHz ≈ 44 Hz.
+static const BoardConfig BOARD = {
+  "CrowPanel Advance 7.0 (V1.3-V1.5)",
+  { 21, 47, 48, 45, 38,   9, 10, 11, 12, 13, 14,   7, 17, 18, 3, 46 },
+  40, 41, 42, 39,
+  18 * 1000 * 1000,
+  4, 8, 8,
+  4, 8, 8,
+  false, false, true, true,
+  true,                        // as in Elecrow's example: frees cache after scan-out reads
+  15, 16,
+};
+#define STC8_ADDR          0x30  // helper MCU: backlight, touch reset, buzzer
+#define STC8_BL_MAX        0     // 0 = brightest … 244 = dimmest
+#define STC8_BL_OFF        245
+#define STC8_TOUCH_ENABLE  250
+#define GT911_ADDR         0x5D
+#define TOUCH_RESET_PIN    1     // pulsed LOW by Elecrow's example during touch bring-up
+#define BOARD_IO19         19    // set OUTPUT by Elecrow's example
+#endif
+
+#define TOUCH_I2C_PORT  I2C_NUM_1   // LovyanGFX owns the touch bus after begin()
+#define BOUNCE_LINES    10          // two SRAM bounce buffers of SCREEN_W * BOUNCE_LINES px
 
 static SemaphoreHandle_t frameDone;
 static volatile uint32_t frameCount = 0;
@@ -29,45 +77,104 @@ static bool IRAM_ATTR onFrameComplete(esp_lcd_panel_handle_t, const esp_lcd_rgb_
   return woken == pdTRUE;
 }
 
-bool CrowPanel7::begin() {
+// ── Board power-up (runs before the panel and touch drivers start) ──────────
+#if defined(BOARD_CROWPANEL_7)
+static void pca9557Write(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(PCA9557_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+static void boardPowerUp() {
   pinMode(LCD_BL_PIN, OUTPUT);
   digitalWrite(LCD_BL_PIN, LOW);
+  pinMode(BOARD_IO38, OUTPUT);
+  digitalWrite(BOARD_IO38, LOW);
+
+  // GT911 reset sequence from Elecrow's V3.0 code: PCA9557 IO0 = RST, IO1 = INT.
+  Wire.begin(BOARD.touch_sda, BOARD.touch_scl);
+  pca9557Write(PCA9557_CONFIG, 0x00);  // all outputs
+  pca9557Write(PCA9557_OUTPUT, 0x00);  // RST low, INT low
+  delay(20);
+  pca9557Write(PCA9557_OUTPUT, 0x01);  // release RST
+  delay(100);
+  pca9557Write(PCA9557_CONFIG, 0x02);  // INT back to input
+  Wire.end();
+}
+
+#elif defined(BOARD_CROWPANEL_ADVANCE_7)
+static bool i2cPresent(uint8_t addr) {
+  Wire.beginTransmission(addr);
+  return Wire.endTransmission() == 0;
+}
+
+static void stc8WireCommand(uint8_t cmd) {
+  Wire.beginTransmission(STC8_ADDR);
+  Wire.write(cmd);
+  Wire.endTransmission();
+}
+
+static void boardPowerUp() {
+  pinMode(BOARD_IO19, OUTPUT);
+  Wire.begin(BOARD.touch_sda, BOARD.touch_scl);
+  delay(50);
+  // Elecrow's bring-up: until both the STC8 and the GT911 answer, ask the STC8
+  // to enable touch and pulse the touch reset line.
+  for (int attempt = 0; attempt < 10; attempt++) {
+    if (i2cPresent(STC8_ADDR) && i2cPresent(GT911_ADDR)) break;
+    Serial.printf("Waiting for STC8 (0x%02X) / GT911 (0x%02X)...\n", STC8_ADDR, GT911_ADDR);
+    stc8WireCommand(STC8_TOUCH_ENABLE);
+    pinMode(TOUCH_RESET_PIN, OUTPUT);
+    digitalWrite(TOUCH_RESET_PIN, LOW);
+    delay(120);
+    pinMode(TOUCH_RESET_PIN, INPUT);
+    delay(100);
+  }
+  stc8WireCommand(STC8_BL_OFF);
+  Wire.end();   // later STC8 writes go through LovyanGFX's I2C on TOUCH_I2C_PORT
+}
+#endif
+
+const char* CrowPanel7::boardName() { return BOARD.name; }
+
+bool CrowPanel7::begin() {
+  boardPowerUp();
 
   frameDone = xSemaphoreCreateBinary();
 
   esp_lcd_rgb_panel_config_t cfg = {};
   cfg.clk_src         = LCD_CLK_SRC_DEFAULT;
-  cfg.timings.pclk_hz = LCD_PCLK_HZ;
+  cfg.timings.pclk_hz = BOARD.pclk_hz;
   cfg.timings.h_res   = SCREEN_W;
   cfg.timings.v_res   = SCREEN_H;
-  cfg.timings.hsync_pulse_width = 48;
-  cfg.timings.hsync_back_porch  = 40;
-  cfg.timings.hsync_front_porch = 40;
-  cfg.timings.vsync_pulse_width = 31;
-  cfg.timings.vsync_back_porch  = 13;
-  cfg.timings.vsync_front_porch = 1;
-  // Same register values LovyanGFX's Bus_RGB produced with Elecrow's config
-  // (hsync/vsync_polarity = 0 → idle low; it never applied pclk_active_neg).
-  cfg.timings.flags.hsync_idle_low  = 1;
-  cfg.timings.flags.vsync_idle_low  = 1;
+  cfg.timings.hsync_pulse_width = BOARD.hsync_pulse;
+  cfg.timings.hsync_back_porch  = BOARD.hsync_back;
+  cfg.timings.hsync_front_porch = BOARD.hsync_front;
+  cfg.timings.vsync_pulse_width = BOARD.vsync_pulse;
+  cfg.timings.vsync_back_porch  = BOARD.vsync_back;
+  cfg.timings.vsync_front_porch = BOARD.vsync_front;
+  cfg.timings.flags.hsync_idle_low  = BOARD.hsync_idle_low;
+  cfg.timings.flags.vsync_idle_low  = BOARD.vsync_idle_low;
   cfg.timings.flags.de_idle_high    = 0;
-  cfg.timings.flags.pclk_active_neg = 0;
-  cfg.timings.flags.pclk_idle_high  = 0;
+  cfg.timings.flags.pclk_active_neg = BOARD.pclk_active_neg;
+  cfg.timings.flags.pclk_idle_high  = BOARD.pclk_idle_high;
 
   cfg.data_width            = 16;
   cfg.bits_per_pixel        = 16;
   cfg.num_fbs               = 2;
   cfg.bounce_buffer_size_px = SCREEN_W * BOUNCE_LINES;
   cfg.dma_burst_size        = 64;
-  cfg.hsync_gpio_num = 39;
-  cfg.vsync_gpio_num = 40;
-  cfg.de_gpio_num    = 41;
-  cfg.pclk_gpio_num  = 0;    // GPIO 0 = BOOT strap; unusable as a button
+  cfg.hsync_gpio_num = BOARD.hsync;
+  cfg.vsync_gpio_num = BOARD.vsync;
+  cfg.de_gpio_num    = BOARD.de;
+  cfg.pclk_gpio_num  = BOARD.pclk;
   cfg.disp_gpio_num  = -1;
   // LovyanGFX stores RGB565 byte-swapped (big-endian), so cross the two data
   // bytes in hardware instead of swapping every pixel in software.
-  for (int i = 0; i < 16; i++) cfg.data_gpio_nums[i ^ 8] = DATA_PINS[i];
-  cfg.flags.fb_in_psram = 1;
+  for (int i = 0; i < 16; i++) cfg.data_gpio_nums[i ^ 8] = BOARD.data_pins[i];
+  cfg.flags.fb_in_psram         = 1;
+  cfg.flags.bb_invalidate_cache = BOARD.bb_invalidate_cache;
 
   if (esp_lcd_new_rgb_panel(&cfg, &_panel) != ESP_OK) return false;
 
@@ -86,12 +193,12 @@ bool CrowPanel7::begin() {
   tc.x_min = 0;  tc.x_max = SCREEN_W - 1;
   tc.y_min = 0;  tc.y_max = SCREEN_H - 1;
   tc.pin_int  = -1;
-  tc.pin_rst  = -1;            // reset is via PCA9557 on V3.0 boards; see resetTouchController()
-  tc.i2c_port = I2C_NUM_1;
-  tc.pin_sda  = TOUCH_SDA;
-  tc.pin_scl  = TOUCH_SCL;
+  tc.pin_rst  = -1;            // reset handled in boardPowerUp()
+  tc.i2c_port = TOUCH_I2C_PORT;
+  tc.pin_sda  = BOARD.touch_sda;
+  tc.pin_scl  = BOARD.touch_scl;
   tc.freq     = 400000;
-  tc.i2c_addr = 0x14;          // driver falls back to 0x5D automatically
+  tc.i2c_addr = 0x5D;          // driver falls back to 0x14 automatically
   _touch.config(tc);
   _touchOk = _touch.init();
   if (!_touchOk) Serial.println("GT911 touch not found");
@@ -112,7 +219,18 @@ void CrowPanel7::present() {
 }
 
 void CrowPanel7::setBacklight(bool on) {
+#if defined(BOARD_CROWPANEL_7)
   digitalWrite(LCD_BL_PIN, on ? HIGH : LOW);
+#elif defined(BOARD_CROWPANEL_ADVANCE_7)
+  uint8_t cmd = on ? STC8_BL_MAX : STC8_BL_OFF;
+  if (lgfx::i2c::transactionWrite(TOUCH_I2C_PORT, STC8_ADDR, &cmd, 1).has_error()) {
+    Serial.println("STC8 backlight write failed");
+  }
+#endif
+}
+
+bool CrowPanel7::setPixelClock(uint32_t hz) {
+  return esp_lcd_rgb_panel_set_pclk(_panel, hz) == ESP_OK;
 }
 
 float CrowPanel7::measureFps() {

@@ -1,5 +1,5 @@
 /**
- * Elecrow CrowPanel 7.0" ESP32 HMI (DIS08070H) — Color Clock with Web Configuration
+ * Elecrow CrowPanel 7.0" (basic DIS08070H or Advance) — Color Clock with Web Configuration
  *
  * Background color = RGB where:
  *   R = hours   (0-23)  mapped → 0-255
@@ -15,19 +15,19 @@
  *   - 12h / 24h format
  *   - Show / hide seconds
  *   - Show / hide date
- *   - Color gamma (this panel renders mid-tones paler than the T-Display's IPS)
+ *   - Color gamma (the basic board's TN panel renders mid-tones pale)
  *
  * WiFi setup via tzapu WiFiManager captive portal.
  * Touch & hold the screen during the boot splash to reset WiFi credentials.
- * (GPIO 0 / BOOT is the display pixel clock on this board, so it can't be used.)
+ * (On the basic board GPIO 0 / BOOT is the display pixel clock, so it can't be used.)
  *
  * Libraries (install via Library Manager):
  *   - LovyanGFX   by lovyan03
  *   - WiFiManager by tzapu
  *   (Preferences, WebServer, ESPmDNS, Wire are built-in to the ESP32 core.)
  *
- * Board: Elecrow CrowPanel 7.0P — PSRAM: Enabled (required for the framebuffers)
- * Display / touch pin config lives in crowpanel7.h.
+ * Build as "ESP32S3 Dev Module" with OPI PSRAM (see README.md for full FQBNs).
+ * Board selection and all display / touch hardware details live in crowpanel7.h/.cpp.
  */
 
 #include <WiFi.h>
@@ -36,7 +36,6 @@
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <time.h>
-#include <Wire.h>
 #include "crowpanel7.h"
 
 // ── Defaults ─────────────────────────────────────────────────────────────────
@@ -47,17 +46,14 @@ const char* AP_NAME            = "ColorClock-Setup";
 const char* AP_PASSWORD        = "sopretty";      // min 8 chars for WPA2
 const char* HOSTNAME           = "colorclock";    // DHCP hostname
 const char* MDNS_NAME          = "colorclock";    // → http://colorclock.local
-const float DEFAULT_GAMMA      = 1.8f;
+#if defined(BOARD_CROWPANEL_7)
+const float DEFAULT_GAMMA      = 1.8f;    // TN panel: darken pale mid-tones
+#else
+const float DEFAULT_GAMMA      = 1.0f;    // IPS: start uncorrected, tune in the web UI
+#endif
 const float MIN_GAMMA          = 1.0f;
 const float MAX_GAMMA          = 3.0f;
 // ─────────────────────────────────────────────────────────────────────────────
-
-// V3.0 boards gate the GT911 reset/INT lines through a PCA9557 I/O expander.
-// On V2.x boards there's no device at this address and the writes are ignored.
-#define PCA9557_ADDR     0x18
-#define PCA9557_OUTPUT   0x01
-#define PCA9557_CONFIG   0x03   // bit = 1 → input
-#define BOARD_IO38       38     // driven LOW by Elecrow's V3.0 reference code
 
 #define WIFI_RESET_WINDOW_MS 3000   // how long the boot splash waits for a touch
 #define WIFI_RESET_HOLD_MS   2000   // how long the touch must be held
@@ -433,6 +429,60 @@ void handleResetWiFi() {
   ESP.restart();
 }
 
+// Panel tuning (not persisted): /panel?mhz=26.67 sets the pixel clock live and
+// reports the measured refresh rate; /panel alone just reports it.
+void handlePanel() {
+  String msg;
+  if (server.hasArg("mhz")) {
+    uint32_t hz = (uint32_t)(server.arg("mhz").toFloat() * 1e6f);
+    bool ok = hz >= 8000000 && hz <= 40000000 && display.setPixelClock(hz);
+    msg += String(ok ? "set pclk " : "rejected pclk ") + server.arg("mhz") + " MHz\n";
+    delay(200);   // let the new clock take effect
+  }
+  msg += "fps=" + String(display.measureFps(), 1) + "\n";
+  Serial.print("Panel: " + msg);
+  server.send(200, "text/plain", msg);
+}
+
+// Diagnostic: /test shows ramps of dark gray/red/green/blue (levels 0-120,
+// raw — no gamma) to find which levels the panel visibly dithers. Stays up for
+// 5 minutes or until /test?off.
+uint32_t testPatternUntil = 0;   // millis() deadline; 0 = clock is showing
+
+void drawTestPattern() {
+  const char* rows[] = {"Gray", "Red", "Green", "Blue"};
+  const int cols = 16, barW = SCREEN_W / cols, rowH = SCREEN_H / 4;
+  spr.fillSprite(TFT_BLACK);
+  useFont(&fonts::DejaVu12);
+  spr.setTextColor(TFT_WHITE);
+  for (int r = 0; r < 4; r++) {
+    for (int c = 0; c < cols; c++) {
+      uint8_t v = c * 8;
+      uint16_t col = rgb888to565(r == 0 || r == 1 ? v : 0,
+                                 r == 0 || r == 2 ? v : 0,
+                                 r == 0 || r == 3 ? v : 0);
+      spr.fillRect(c * barW, r * rowH, barW, rowH, col);
+      spr.setTextDatum(BC_DATUM);
+      spr.drawString(String(v), c * barW + barW/2, r * rowH + rowH - 4);
+    }
+    spr.setTextDatum(TL_DATUM);
+    spr.drawString(rows[r], 4, r * rowH + 4);
+  }
+  spr.setTextDatum(MC_DATUM);
+  presentFrame();
+}
+
+void handleTest() {
+  if (server.hasArg("off")) {
+    testPatternUntil = millis() | 1;   // already expired → loop() restores the clock
+    server.send(200, "text/plain", "clock restored\n");
+    return;
+  }
+  drawTestPattern();
+  testPatternUntil = (millis() + 300000) | 1;
+  server.send(200, "text/plain", "test pattern on for 5 min; /test?off to return\n");
+}
+
 void handleNotFound() {
   server.send(404, "text/plain", "Not found");
 }
@@ -442,6 +492,8 @@ void setupWebServer() {
   server.on("/save",      HTTP_POST, handleSave);
   server.on("/time",      handleTime);
   server.on("/reset_wifi",HTTP_POST, handleResetWiFi);
+  server.on("/panel",     handlePanel);
+  server.on("/test",      handleTest);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -498,34 +550,10 @@ float pickTextScale(const String& s, int maxWidth, int maxHeight, float startSca
   return 1.0f;
 }
 
-// ── GT911 reset sequence (from Elecrow V3.0 reference code) ─────────────────
-// PCA9557 IO0 = touch RST, IO1 = touch INT. Harmless on V2.x boards.
-static void pca9557Write(uint8_t reg, uint8_t val) {
-  Wire.beginTransmission(PCA9557_ADDR);
-  Wire.write(reg);
-  Wire.write(val);
-  Wire.endTransmission();
-}
-
-void resetTouchController() {
-  pinMode(BOARD_IO38, OUTPUT);
-  digitalWrite(BOARD_IO38, LOW);
-
-  Wire.begin(TOUCH_SDA, TOUCH_SCL);
-  pca9557Write(PCA9557_CONFIG, 0x00);  // all outputs
-  pca9557Write(PCA9557_OUTPUT, 0x00);  // RST low, INT low
-  delay(20);
-  pca9557Write(PCA9557_OUTPUT, 0x01);  // release RST
-  delay(100);
-  pca9557Write(PCA9557_CONFIG, 0x02);  // INT back to input
-  Wire.end();                          // LovyanGFX drives these pins on I2C_NUM_1
-}
-
 // ── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-
-  resetTouchController();
+  Serial.printf("Board: %s\n", CrowPanel7::boardName());
 
   if (!display.begin()) {
     Serial.println("Display init failed — is OPI PSRAM enabled in the board options?");
@@ -566,6 +594,12 @@ void loop() {
       setupWiFi();
       applyTimeSettings();
     }
+  }
+
+  if (testPatternUntil) {
+    if ((int32_t)(millis() - testPatternUntil) < 0) { delay(50); return; }
+    testPatternUntil = 0;
+    lastS = -1;   // force a clock redraw
   }
 
   struct tm ti;

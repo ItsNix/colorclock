@@ -1,18 +1,28 @@
 /**
- * Display + touch driver for the Elecrow CrowPanel 7.0" ESP32 HMI (DIS08070H).
- *   - 800x480 16-bit parallel RGB panel, driven by ESP-IDF's esp_lcd RGB driver
- *     with two PSRAM framebuffers (tear-free swap at frame end) and SRAM bounce
- *     buffers (tolerates PSRAM stalls from WiFi / flash writes)
- *   - Backlight on GPIO 2 (plain on/off)
- *   - GT911 capacitive touch on I2C SDA 19 / SCL 20 (via LovyanGFX)
+ * Display + touch driver for Elecrow CrowPanel 7.0" ESP32 boards (800x480 RGB).
+ *
+ * Supported boards (pick at compile time):
+ *   BOARD_CROWPANEL_7          CrowPanel 7.0" HMI, SKU DIS08070H (TN), hardware V2.x / V3.0
+ *   BOARD_CROWPANEL_ADVANCE_7  CrowPanel Advance 7.0" (IPS), hardware V1.3 / V1.4 / V1.5
+ * Default is BOARD_CROWPANEL_7; for the Advance add
+ *   --build-property compiler.cpp.extra_flags=-DBOARD_CROWPANEL_ADVANCE_7
+ * (Advance V1.0 / V1.2 use different backlight / touch-reset hardware and are not supported.)
+ *
+ * Both boards use ESP-IDF's esp_lcd RGB driver with two PSRAM framebuffers
+ * (tear-free swap at frame end) and SRAM bounce buffers (tolerates PSRAM stalls
+ * from WiFi / flash writes), plus LovyanGFX's GT911 touch driver.
  *
  * Drawing is done with LovyanGFX: bind an LGFX_Sprite to backBuffer(), draw a
  * full frame, then call present().
- *
- * Pin and timing values taken from Elecrow's reference gfx_conf.h (CrowPanel_70),
- * which is identical for hardware V2.x and V3.0.
  */
 #pragma once
+
+#if !defined(BOARD_CROWPANEL_7) && !defined(BOARD_CROWPANEL_ADVANCE_7)
+#define BOARD_CROWPANEL_7
+#endif
+#if defined(BOARD_CROWPANEL_7) && defined(BOARD_CROWPANEL_ADVANCE_7)
+#error "Define only one of BOARD_CROWPANEL_7 / BOARD_CROWPANEL_ADVANCE_7"
+#endif
 
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
@@ -21,12 +31,9 @@
 #define SCREEN_W  800
 #define SCREEN_H  480
 
-#define TOUCH_SDA 19
-#define TOUCH_SCL 20
-
 class CrowPanel7 {
 public:
-  // Creates the panel and touch driver. Backlight stays off until setBacklight(true).
+  // Powers up the board, panel and touch. Backlight stays off until setBacklight(true).
   bool begin();
 
   // Framebuffer that is not on screen; draw the next frame into it.
@@ -38,7 +45,12 @@ public:
 
   void setBacklight(bool on);
   float measureFps();   // blocks ~1 s
+  // Change the pixel clock live (takes effect next frame). The real clock is
+  // 160 MHz / integer, so the requested value is rounded by the driver.
+  bool setPixelClock(uint32_t hz);
   bool touched();
+
+  static const char* boardName();
 
 private:
   esp_lcd_panel_handle_t _panel = nullptr;
