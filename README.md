@@ -101,3 +101,9 @@ power cut it needs WiFi to get the time.
 - `fonts.h`: **generated** anti-aliased fonts. Don't edit it; rerun
   `python3 tools/make_fonts.py` (needs Pillow with FreeType and DejaVu Sans Bold).
 - `smooth_font.h`, `app_types.h`: small helper headers
+
+## License
+
+MIT; see [LICENSE](LICENSE). The font data in `fonts.h` is rendered from
+DejaVu Sans Bold, which is under the
+[DejaVu Fonts license](https://dejavu-fonts.github.io/License.html).
