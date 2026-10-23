@@ -81,7 +81,9 @@ Web UI (`http://colorclock.local`):
 
 On screen: tap the **top-left and then the top-right corner** (either order)
 within 5 seconds. Tabs cover clock format and brightness, the dim and off
-schedules, and the chime. Changes apply immediately. Tap **Done** to save; the
+schedules, and the chime. The IP address is shown along the bottom while
+WiFi is connected. This works while the screen is dimmed too; if it's off, tap
+once to wake it first. Changes apply immediately. Tap **Done** to save; the
 screen also saves and closes on its own after 60 seconds without a touch.
 
 While the screen is dimmed or off, a tap brightens it one step (off → dim →

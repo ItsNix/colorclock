@@ -425,8 +425,8 @@ void setBacklightLevel(uint8_t level, const char* why) {
 // Normal brightness, or the dim level / off per schedule. While dim or off a
 // tap brightens one step for wake_s (off → dim level, dim → normal), re-armed
 // while touching. Frames keep rendering while off, so the clock is current the
-// moment the screen comes on. Returns true if this pass's tap was used to wake.
-bool updateScreenPower(const struct tm& ti) {
+// moment the screen comes on.
+void updateScreenPower(const struct tm& ti) {
   Schedule sched = scheduleAt(ti);
   uint8_t dimLevel  = min(settings.dim_level, settings.brightness);
   uint8_t scheduled = sched == SCHED_OFF ? 0 : sched == SCHED_DIM ? dimLevel : settings.brightness;
@@ -445,7 +445,6 @@ bool updateScreenPower(const struct tm& ti) {
   }
   setBacklightLevel(level, wakeUntil ? "tapped" : sched == SCHED_OFF ? "off schedule"
                          : sched == SCHED_DIM ? "dim schedule" : "normal");
-  return woke;
 }
 
 // ── Hourly chime (boards with a buzzer) ─────────────────────────────────────
@@ -876,8 +875,8 @@ bool lastOnline = false;
 
 // ── On-screen settings ──────────────────────────────────────────────────────
 // Opened by tapping the top-left and top-right corners (either order) within
-// CORNER_WINDOW_MS while the screen is at normal brightness. Changes apply
-// live; Done, or CONFIG_IDLE_MS without a touch, saves and returns to the clock.
+// CORNER_WINDOW_MS while the screen is lit (normal or dim). The IP address, if
+// connected, is shown along the bottom. Changes apply live; Done, or CONFIG_IDLE_MS without a touch, saves and returns to the clock.
 #define CORNER_W          160
 #define CORNER_H          120
 #define CORNER_WINDOW_MS  5000
@@ -889,8 +888,9 @@ bool lastOnline = false;
 #define TAB_W     160             // 4 page tabs + Done across the top
 #define HEADER_H  80
 #define ROWS_Y    100
-#define ROW_H     95
+#define ROW_H     85
 #define CTRL_H    64
+#define FOOTER_Y  (SCREEN_H - 20)   // IP address line, below the last row
 
 const char* configTabs[] = {"Clock", "Dim", "Off", "Chime"};
 int configPageCount() { return CrowPanel7::hasBuzzer() ? 4 : 3; }
@@ -929,6 +929,11 @@ uint32_t dimPreviewUntil = 0;     // 0 = no preview
 int      heldRow = -1, heldDir = 0;
 uint32_t nextRepeat = 0;
 uint32_t cornerTapL = 0, cornerTapR = 0;   // millis() of the last tap in each top corner
+String   configIp;                // IP shown in the footer; "" = not connected
+
+String currentIp() {
+  return WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString() : String();
+}
 
 void openConfig() {
   configOpen = true;
@@ -1026,6 +1031,13 @@ void drawConfig(const ConfigRow* rows, int n) {
       spr.drawString(v, 595, cy);
     }
   }
+
+  configIp = currentIp();
+  if (configIp.length()) {
+    useFont(fontText24);
+    spr.setTextColor(rgb888to565(150, 150, 160), BG);
+    spr.drawString("IP: " + configIp, SCREEN_W / 2, FOOTER_Y);
+  }
   presentFrame();
 }
 
@@ -1091,6 +1103,7 @@ void runConfig() {
   setBacklightLevel(dimPreviewUntil ? min(settings.dim_level, settings.brightness)
                                     : settings.brightness, "settings");
 
+  if (currentIp() != configIp) configDirty = true;
   if (configDirty) {
     configDirty = false;
     drawConfig(rows, n);
@@ -1162,8 +1175,11 @@ void loop() {
     return;
   }
 
-  bool tapWoke = updateScreenPower(ti);
-  if (!tapWoke && backlightLevel == settings.brightness) checkCornerTaps();
+  // Corner taps count whenever the screen was visible, so the settings open
+  // from dim too (the first tap also brightens it); a tap on a dark screen only wakes it.
+  bool wasVisible = backlightLevel > 0;
+  updateScreenPower(ti);
+  if (wasVisible) checkCornerTaps();
   if (configOpen) return;
   checkHourlyChime(ti);
 
