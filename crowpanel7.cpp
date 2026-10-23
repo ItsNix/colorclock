@@ -35,6 +35,7 @@ static const BoardConfig BOARD = {
   19, 20,
 };
 #define LCD_BL_PIN       2
+#define LCD_BL_PWM_HZ    5000  // backlight dimming via LEDC, 8-bit duty
 #define PCA9557_ADDR     0x18  // V3.0: gates GT911 RST/INT; absent on V2.x (writes ignored)
 #define PCA9557_OUTPUT   0x01
 #define PCA9557_CONFIG   0x03  // bit = 1 → input
@@ -57,6 +58,8 @@ static const BoardConfig BOARD = {
 #define STC8_ADDR          0x30  // helper MCU: backlight, touch reset, buzzer
 #define STC8_BL_MAX        0     // 0 = brightest … 244 = dimmest
 #define STC8_BL_OFF        245
+#define STC8_BUZZER_ON     246   // not in Elecrow's examples; from a V1.3 ESP-IDF demo
+#define STC8_BUZZER_OFF    247
 #define STC8_TOUCH_ENABLE  250
 #define GT911_ADDR         0x5D
 #define BM8563_ADDR        0x51  // RTC (PCF8563-compatible), CR1220 backup cell
@@ -90,8 +93,8 @@ static void pca9557Write(uint8_t reg, uint8_t val) {
 }
 
 static void boardPowerUp() {
-  pinMode(LCD_BL_PIN, OUTPUT);
-  digitalWrite(LCD_BL_PIN, LOW);
+  ledcAttach(LCD_BL_PIN, LCD_BL_PWM_HZ, 8);
+  ledcWrite(LCD_BL_PIN, 0);
   pinMode(BOARD_IO38, OUTPUT);
   digitalWrite(BOARD_IO38, LOW);
 
@@ -221,14 +224,28 @@ void CrowPanel7::present() {
   _back ^= 1;
 }
 
-void CrowPanel7::setBacklight(bool on) {
-#if defined(BOARD_CROWPANEL_7)
-  digitalWrite(LCD_BL_PIN, on ? HIGH : LOW);
-#elif defined(BOARD_CROWPANEL_ADVANCE_7)
-  uint8_t cmd = on ? STC8_BL_MAX : STC8_BL_OFF;
+#if defined(BOARD_CROWPANEL_ADVANCE_7)
+static void stc8Command(uint8_t cmd) {
   if (lgfx::i2c::transactionWrite(TOUCH_I2C_PORT, STC8_ADDR, &cmd, 1).has_error()) {
-    Serial.println("STC8 backlight write failed");
+    Serial.printf("STC8 command %u failed\n", cmd);
   }
+}
+#endif
+
+void CrowPanel7::setBrightness(uint8_t percent) {
+  percent = min<uint8_t>(percent, 100);
+#if defined(BOARD_CROWPANEL_7)
+  ledcWrite(LCD_BL_PIN, percent * 255 / 100);
+#elif defined(BOARD_CROWPANEL_ADVANCE_7)
+  // 1..100 % → 244 (dimmest) .. 0 (brightest); 0 % → off.
+  stc8Command(percent == 0 ? STC8_BL_OFF
+                           : STC8_BL_MAX + (100 - percent) * (STC8_BL_OFF - 1 - STC8_BL_MAX) / 99);
+#endif
+}
+
+void CrowPanel7::setBuzzer(bool on) {
+#if defined(BOARD_CROWPANEL_ADVANCE_7)
+  stc8Command(on ? STC8_BUZZER_ON : STC8_BUZZER_OFF);
 #endif
 }
 
@@ -291,7 +308,15 @@ float CrowPanel7::measureFps() {
 }
 
 bool CrowPanel7::touched() {
+  int x, y;
+  return touchPoint(x, y);
+}
+
+bool CrowPanel7::touchPoint(int& x, int& y) {
   if (!_touchOk) return false;
   lgfx::touch_point_t tp;
-  return _touch.getTouchRaw(&tp, 1) > 0;
+  if (_touch.getTouchRaw(&tp, 1) == 0) return false;
+  x = tp.x;
+  y = tp.y;
+  return true;
 }

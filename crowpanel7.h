@@ -46,12 +46,24 @@ public:
   // front buffer is no longer being scanned out (it becomes the new back buffer).
   void present();
 
-  void setBacklight(bool on);
+  // Backlight level in percent; 0 = off.
+  void setBrightness(uint8_t percent);
+  // Board buzzer (Advance only; no-op on the basic board).
+  static constexpr bool hasBuzzer() {
+#if defined(BOARD_CROWPANEL_ADVANCE_7)
+    return true;
+#else
+    return false;
+#endif
+  }
+  void setBuzzer(bool on);
   float measureFps();   // blocks ~1 s
   // Change the pixel clock live (takes effect next frame). The real clock is
   // 160 MHz / integer, so the requested value is rounded by the driver.
   bool setPixelClock(uint32_t hz);
   bool touched();
+  // First touch point in screen pixels; false when not touched.
+  bool touchPoint(int& x, int& y);
 
   // Battery-backed RTC (Advance: BM8563), kept in UTC. Both return false if the
   // board has none, or (read) it holds no valid time, e.g. no coin cell yet.
