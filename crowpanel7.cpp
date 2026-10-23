@@ -59,6 +59,7 @@ static const BoardConfig BOARD = {
 #define STC8_BL_OFF        245
 #define STC8_TOUCH_ENABLE  250
 #define GT911_ADDR         0x5D
+#define BM8563_ADDR        0x51  // RTC (PCF8563-compatible), CR1220 backup cell
 #define TOUCH_RESET_PIN    1     // pulsed LOW by Elecrow's example during touch bring-up
 #define BOARD_IO19         19    // set OUTPUT by Elecrow's example
 #endif
@@ -228,6 +229,54 @@ void CrowPanel7::setBacklight(bool on) {
   if (lgfx::i2c::transactionWrite(TOUCH_I2C_PORT, STC8_ADDR, &cmd, 1).has_error()) {
     Serial.println("STC8 backlight write failed");
   }
+#endif
+}
+
+#if defined(BOARD_CROWPANEL_ADVANCE_7)
+static uint8_t bcd(int v)       { return (v / 10) << 4 | (v % 10); }
+static int     unbcd(uint8_t b) { return (b >> 4) * 10 + (b & 0x0F); }
+
+// Days since 1970-01-01 for a Gregorian date (newlib has no timegm()).
+static int64_t daysFromCivil(int y, int m, int d) {
+  y -= m <= 2;
+  int era = y / 400;                    // y >= 2000 here, so no negative-era fixup
+  int yoe = y - era * 400;
+  int doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return (int64_t)era * 146097 + doe - 719468;
+}
+#endif
+
+bool CrowPanel7::readRtc(time_t& utc) {
+#if defined(BOARD_CROWPANEL_ADVANCE_7)
+  uint8_t reg = 0x02, r[7];   // seconds, minutes, hours, day, weekday, month, year
+  if (lgfx::i2c::transactionWriteRead(TOUCH_I2C_PORT, BM8563_ADDR, &reg, 1, r, 7).has_error()) {
+    return false;
+  }
+  if (r[0] & 0x80) return false;   // VL: oscillator stopped since the last write (no / flat cell)
+  int64_t days = daysFromCivil(2000 + unbcd(r[6]), unbcd(r[5] & 0x1F), unbcd(r[3] & 0x3F));
+  utc = days * 86400 + unbcd(r[2] & 0x3F) * 3600 + unbcd(r[1] & 0x7F) * 60 + unbcd(r[0] & 0x7F);
+  return true;
+#else
+  return false;
+#endif
+}
+
+bool CrowPanel7::writeRtc(time_t utc) {
+#if defined(BOARD_CROWPANEL_ADVANCE_7)
+  struct tm t;
+  gmtime_r(&utc, &t);
+  const uint8_t w[] = {
+    0x00,                           // start register
+    0x00, 0x00,                     // control 1 (clock running), control 2 (no alarm/timer)
+    bcd(t.tm_sec),                  // writing seconds also clears VL
+    bcd(t.tm_min), bcd(t.tm_hour), bcd(t.tm_mday), (uint8_t)t.tm_wday,
+    bcd(t.tm_mon + 1),              // century bit 0 = 20xx
+    bcd(t.tm_year % 100),
+  };
+  return !lgfx::i2c::transactionWrite(TOUCH_I2C_PORT, BM8563_ADDR, w, sizeof(w)).has_error();
+#else
+  return false;
 #endif
 }
 

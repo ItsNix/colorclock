@@ -27,6 +27,7 @@
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
 #include <esp_lcd_panel_rgb.h>
+#include <time.h>
 
 #define SCREEN_W  800
 #define SCREEN_H  480
@@ -51,6 +52,11 @@ public:
   // 160 MHz / integer, so the requested value is rounded by the driver.
   bool setPixelClock(uint32_t hz);
   bool touched();
+
+  // Battery-backed RTC (Advance: BM8563), kept in UTC. Both return false if the
+  // board has none, or (read) it holds no valid time, e.g. no coin cell yet.
+  bool readRtc(time_t& utc);
+  bool writeRtc(time_t utc);
 
   static const char* boardName();
 
