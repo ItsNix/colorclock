@@ -587,6 +587,18 @@ void handleTest() {
   server.send(200, "text/plain", "test pattern on for 5 min; /test?off to return\n");
 }
 
+// Diagnostic: /snap returns the on-screen framebuffer as raw RGB565 (byte-swapped,
+// 800x480). Blocks the loop while sending, so the buffer can't change mid-transfer.
+void handleSnap() {
+  const uint8_t* fb = (const uint8_t*)display.frontBuffer();
+  const size_t len = SCREEN_W * SCREEN_H * 2;
+  server.setContentLength(len);
+  server.send(200, "application/octet-stream", "");
+  for (size_t off = 0; off < len; off += 4096) {
+    server.sendContent((const char*)fb + off, min<size_t>(4096, len - off));
+  }
+}
+
 void handleNotFound() {
   server.send(404, "text/plain", "Not found");
 }
@@ -598,6 +610,7 @@ void setupWebServer() {
   server.on("/reset_wifi",HTTP_POST, handleResetWiFi);
   server.on("/panel",     handlePanel);
   server.on("/test",      handleTest);
+  server.on("/snap",      handleSnap);
   server.onNotFound(handleNotFound);
   server.begin();
 
@@ -661,8 +674,10 @@ void setup() {
   loadSettings();
   buildGammaLut();
 
-  Serial.printf("Display %dx%d, double-buffered, %.1f fps\n",
-                SCREEN_W, SCREEN_H, display.measureFps());
+  Serial.printf("Display %dx%d, double-buffered, %.1f fps; free internal RAM %u KB, PSRAM %u KB\n",
+                SCREEN_W, SCREEN_H, display.measureFps(),
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024,
+                heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024);
   Serial.printf("Loaded: ntp=%s tz=%s 24h=%d secs=%d date=%d gamma=%.1f night=%d %s-%s wake=%us\n",
                 settings.ntp_server.c_str(), settings.tz_string.c_str(),
                 settings.format_24h, settings.show_seconds, settings.show_date,

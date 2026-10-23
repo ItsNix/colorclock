@@ -64,7 +64,9 @@ static const BoardConfig BOARD = {
 #endif
 
 #define TOUCH_I2C_PORT  I2C_NUM_1   // LovyanGFX owns the touch bus after begin()
-#define BOUNCE_LINES    10          // two SRAM bounce buffers of SCREEN_W * BOUNCE_LINES px
+// Two internal-SRAM bounce buffers of SCREEN_W * BOUNCE_LINES px (2 x 32 KB at 20).
+// Larger = more slack before scan-out underruns when PSRAM/flash are busy.
+#define BOUNCE_LINES    20
 
 static SemaphoreHandle_t frameDone;
 static volatile uint32_t frameCount = 0;

@@ -38,6 +38,8 @@ public:
 
   // Framebuffer that is not on screen; draw the next frame into it.
   void* backBuffer() const { return _fb[_back]; }
+  // Framebuffer currently being scanned out (read-only use, e.g. screenshots).
+  const void* frontBuffer() const { return _fb[_back ^ 1]; }
 
   // Shows the back buffer from the next frame on, and returns once the old
   // front buffer is no longer being scanned out (it becomes the new back buffer).
