@@ -83,6 +83,36 @@ static bool IRAM_ATTR onFrameComplete(esp_lcd_panel_handle_t, const esp_lcd_rgb_
   return woken == pdTRUE;
 }
 
+// Workaround for an esp_lcd bounce-buffer desync (IDF 5.5.4 as shipped with
+// the Arduino core, which sets CONFIG_LCD_RGB_RESTART_IN_VSYNC). Each DMA EOF
+// refills bounce buffer bb_eof_count % 2, and the per-frame restart always
+// starts the DMA at buffer 0, but with that option the driver never resets
+// bb_eof_count. The EOF/LCD ISRs aren't IRAM-safe in that build, so a flash
+// write (WiFi NVS at boot, saving settings) can merge two EOFs into one; with
+// an even number of bounce buffers per frame the parity then stays flipped and
+// everything below the first bounce buffer shows BOUNCE_LINES too high, until
+// an EN reset. Zeroing the count at VSYNC (on_vsync runs just before the
+// restart, in the same ISR) puts the next fill back on buffer 0.
+static volatile size_t* bbEofCount = nullptr;
+
+static bool IRAM_ATTR onVsync(esp_lcd_panel_handle_t, const esp_lcd_rgb_panel_event_data_t*, void*) {
+  if (bbEofCount) *bbEofCount = 0;
+  return false;
+}
+
+// bb_eof_count is private to the driver. Find it by its neighbours in the
+// panel struct: expect_eof_count (bounce buffers per frame), then
+// on_color_trans_done (unused, NULL) and on_frame_buf_complete (ours).
+static volatile size_t* findBbEofCount(esp_lcd_panel_handle_t panel) {
+  const uintptr_t* w = (const uintptr_t*)panel;
+  for (int i = 3; i < 256; i++) {
+    if (w[i] == (uintptr_t)onFrameComplete && w[i - 1] == 0 && w[i - 2] == SCREEN_H / BOUNCE_LINES) {
+      return (volatile size_t*)&w[i - 3];
+    }
+  }
+  return nullptr;
+}
+
 // ── Board power-up (runs before the panel and touch drivers start) ──────────
 #if defined(BOARD_CROWPANEL_7)
 static void pca9557Write(uint8_t reg, uint8_t val) {
@@ -186,7 +216,10 @@ bool CrowPanel7::begin() {
 
   esp_lcd_rgb_panel_event_callbacks_t cbs = {};
   cbs.on_frame_buf_complete = onFrameComplete;
+  cbs.on_vsync              = onVsync;
   esp_lcd_rgb_panel_register_event_callbacks(_panel, &cbs, nullptr);
+  bbEofCount = findBbEofCount(_panel);
+  if (!bbEofCount) Serial.println("esp_lcd layout not recognised: bounce-buffer resync disabled");
 
   esp_lcd_panel_reset(_panel);
   esp_lcd_panel_init(_panel);
