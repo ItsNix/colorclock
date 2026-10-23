@@ -945,6 +945,10 @@ void closeConfig() {
   saveSettings();
   logSettings("Saved (on screen)");
   lastS = -1;   // redraw the clock
+  // Stay at normal brightness for wake_s, as after a tap, so a dim / off
+  // schedule doesn't blank the screen the instant Done is pressed.
+  wakeLevel = settings.brightness;
+  wakeUntil = (millis() + settings.wake_s * 1000UL) | 1;
 }
 
 // A tap in one top corner, then the other within CORNER_WINDOW_MS, opens the settings.
